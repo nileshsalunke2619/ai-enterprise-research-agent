@@ -1,14 +1,25 @@
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+)
 from sqlalchemy.orm import Session
 
 from app.agent.graph import build_research_graph
+from app.api.auth import get_current_user
 from app.db.database import get_db
-from app.db.models import ResearchReport
+from app.db.models import (
+    AgentRun,
+    ResearchReport,
+    Source,
+    User,
+)
 from app.schemas.research import (
     ResearchRequest,
     ResearchResponse,
 )
-
 
 router = APIRouter(
     prefix="/research",
@@ -23,74 +34,219 @@ router = APIRouter(
 async def create_research(
     request: ResearchRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
 
-    # --------------------------------------------------
-    # 1. Build LangGraph
-    # --------------------------------------------------
+    company_name = request.company_name.strip()
 
-    graph = build_research_graph()
+    if not company_name:
 
-    # --------------------------------------------------
-    # 2. Initial agent state
-    # --------------------------------------------------
+        raise HTTPException(
+            status_code=400,
+            detail="Company name cannot be empty.",
+        )
 
-    initial_state = {
-        "company_name": request.company_name,
-        "errors": [],
-    }
+    # ========================================================
+    # 1. CREATE AGENT RUN
+    # ========================================================
 
-    # --------------------------------------------------
-    # 3. Execute agent
-    # --------------------------------------------------
+    agent_run = AgentRun(
+        company_name=company_name,
+        status="running",
+        user_id=current_user.id,
+        started_at=datetime.utcnow(),
+    )
+
+    db.add(agent_run)
+    db.commit()
+    db.refresh(agent_run)
 
     try:
+
+        # ====================================================
+        # 2. BUILD GRAPH
+        # ====================================================
+
+        graph = build_research_graph()
+
+        # ====================================================
+        # 3. INITIAL STATE
+        # ====================================================
+
+        initial_state = {
+            "company_name": company_name,
+            "errors": [],
+        }
+
+        # ====================================================
+        # 4. RUN AGENT
+        # ====================================================
 
         result = await graph.ainvoke(
             initial_state
         )
 
+        agent_errors = result.get(
+            "errors",
+            []
+        )
+
+        # ====================================================
+        # 5. GET REPORT
+        # ====================================================
+
+        report_content = result.get(
+            "report"
+        )
+
+        if not report_content:
+
+            raise ValueError(
+                "Agent completed without "
+                "generating a report."
+            )
+
+        # ====================================================
+        # 6. CONVERT JSON STRING → DICT
+        # ====================================================
+
+        import json
+
+        try:
+
+            report_json = json.loads(
+                report_content
+            )
+
+        except json.JSONDecodeError as error:
+
+            raise ValueError(
+                f"Generated report is not valid JSON: {error}"
+            )
+
+        final_company_name = result.get(
+            "company_name",
+            company_name,
+        )
+ # ====================================================
+        # 7. SAVE REPORT
+        # ====================================================
+
+        report = ResearchReport(
+            company_name=final_company_name,
+            report_content=report_content,
+            report_json=report_json,
+            user_id=current_user.id,
+        )
+
+        db.add(report)
+
+        db.flush()
+
+        # ====================================================
+        # 8. SAVE SOURCES
+        # ====================================================
+
+        evidence = result.get(
+            "evidence",
+            []
+        )
+
+        saved_urls = set()
+
+        for item in evidence:
+
+            if not isinstance(
+                item,
+                dict
+            ):
+                continue
+
+            url = item.get(
+                "url",
+                ""
+            )
+
+            title = item.get(
+                "title",
+                "Unknown source"
+            )
+
+            if not url:
+                continue
+
+            url = str(url).strip()
+
+            if not url:
+                continue
+
+            if url in saved_urls:
+                continue
+
+            saved_urls.add(url)
+
+            source = Source(
+                url=url,
+                title=title,
+                report_id=report.id,
+            )
+
+            db.add(source)
+
+        # ====================================================
+        # 9. UPDATE AGENT RUN
+        # ====================================================
+
+        agent_run.status = "completed"
+
+        agent_run.completed_at = (
+            datetime.utcnow()
+        )
+
+        agent_run.report_id = report.id
+
+        if agent_errors:
+
+            agent_run.error_message = (
+                "; ".join(
+                    str(error)
+                    for error in agent_errors
+                )
+            )
+
+        # ====================================================
+        # 10. COMMIT EVERYTHING
+        # ====================================================
+
+        db.commit()
+
+        db.refresh(report)
+
+        return report
+
     except Exception as error:
 
-        raise HTTPException(
-            status_code=502,
-            detail=f"Agent execution failed: {error}",
+        # ====================================================
+        # AGENT FAILURE
+        # ====================================================
+
+        db.rollback()
+
+        agent_run.status = "failed"
+
+        agent_run.completed_at = (
+            datetime.utcnow()
         )
 
-    # --------------------------------------------------
-    # 4. Get generated report
-    # --------------------------------------------------
+        agent_run.error_message = str(
+            error
+        )
 
-    report_content = result.get("report")
+        db.add(agent_run)
 
-    if not report_content:
+        db.commit()
 
         raise HTTPException(
             status_code=502,
-            detail="Agent completed without generating a report.",
+            detail=f"Research agent failed: {error}",
         )
-
-    # --------------------------------------------------
-    # 5. Save report in PostgreSQL
-    # --------------------------------------------------
-
-    company_name = result.get(
-        "company_name",
-        request.company_name,
-    )
-
-    report = ResearchReport(
-        company_name=company_name,
-        report_content=report_content,
-        user_id=1,  # temporary until JWT authentication
-    )
-
-    db.add(report)
-    db.commit()
-    db.refresh(report)
-
-    # --------------------------------------------------
-    # 6. Return API response
-    # --------------------------------------------------
-
-    return report

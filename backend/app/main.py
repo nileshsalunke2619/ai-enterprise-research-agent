@@ -2,6 +2,11 @@ from fastapi import FastAPI
 from app.config import settings
 from app.api.users import router as users_router
 from app.api.research import router as research_router
+from app.api.users import router as auth_router
+from app.api.research import router as research_router
+from app.api.users import router as users_router
+
+
 
 
 app = FastAPI(
@@ -11,7 +16,7 @@ app = FastAPI(
 )
 
 app.include_router(users_router)
-
+app.include_router(auth_router)
 app.include_router(research_router)
 
 @app.get("/")

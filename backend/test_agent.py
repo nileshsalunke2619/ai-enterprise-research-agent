@@ -55,9 +55,8 @@ async def main():
 
     if report:
 
-        parsed_report = json.loads(
-            report
-        )
+        parsed_report = report.model_dump() 
+        
 
         print(
             json.dumps(
